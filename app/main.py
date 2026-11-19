@@ -52,6 +52,21 @@ SOURCE_REASON_TEXT = {
     "POINTS_REPLACED": "定位点换版",
     "RADIUS_CHANGED": "匹配半径变更",
     "SUPERSEDED": "被更新的结果取代",
+    "NETWORK_QC_OPEN": "路网质检启动，停止供数",
+}
+
+QC_STATE_TEXT = {
+    "pending": "待核",
+    "running": "质检中",
+    "passed": "质检通过",
+    "rejected": "质检不通过",
+    "failed": "计算出错（待重试）",
+    "revoked": "已撤销（路网已换版）",
+}
+
+QC_FINDING_TEXT = {
+    "intersection": "内点相交",
+    "overlap": "共线重叠",
 }
 
 
@@ -72,7 +87,18 @@ class Worker(threading.Thread):
         try:
             while not self.stop_event.is_set():
                 job = None
+                check = None
                 try:
+                    check = service.claim_quality_check(conn)
+                    if check is not None:
+                        log.info(
+                            "running quality check %s (network r%s)",
+                            check["id"],
+                            check["network_revision_id"],
+                        )
+                        state = service.execute_quality_check(conn, check)
+                        log.info("quality check %s finished: %s", check["id"], state)
+                        continue
                     job = service.claim_job(conn)
                     if job is None:
                         self.wake_event.wait(0.5)
@@ -88,8 +114,19 @@ class Worker(threading.Thread):
                     service.execute_job(conn, job)
                     log.info("job %s finished", job["id"])
                 except Exception:  # noqa: BLE001 - worker must survive
-                    log.exception("job failed")
-                    if job is not None:
+                    log.exception("background task failed")
+                    if check is not None:
+                        try:
+                            service.fail_quality_check(
+                                conn,
+                                check["id"],
+                                check["claim_token"] or "",
+                                "质检计算失败，稍后自动重试",
+                                check["attempts"] or 0,
+                            )
+                        except Exception:  # noqa: BLE001
+                            log.exception("could not record quality check failure")
+                    elif job is not None:
                         try:
                             service.fail_job(
                                 conn,
@@ -133,6 +170,11 @@ async def lifespan(app: FastAPI):
         reset = service.reset_running_jobs(conn)
         if reset:
             log.info("reset %s interrupted job(s) to pending", reset)
+        reset_qc = service.reset_running_quality_checks(conn)
+        if reset_qc:
+            log.info(
+                "reset %s interrupted quality check(s) to pending", reset_qc
+            )
     finally:
         conn.close()
     if WORKER_ENABLED:
@@ -251,6 +293,16 @@ def dashboard(request: Request, notice: str | None = None, error: str | None = N
         ).fetchall()
         network_revisions = db.list_revisions(conn, "network", 10)
         points_revisions = db.list_revisions(conn, "points", 10)
+        qc_row = service.latest_quality_check(conn)
+        qc_findings = json.loads(qc_row["findings_json"]) if qc_row else []
+        qc_history = conn.execute(
+            """
+            SELECT q.*, nr.revision_no AS network_rev_no
+            FROM quality_checks q
+            JOIN network_revisions nr ON nr.id = q.network_revision_id
+            ORDER BY q.id DESC LIMIT 10
+            """
+        ).fetchall()
         stale_results = conn.execute(
             """
             SELECT r.*, nr.revision_no AS network_rev_no,
@@ -272,6 +324,7 @@ def dashboard(request: Request, notice: str | None = None, error: str | None = N
         and job["points_revision_id"] == points_revision["id"]
         and abs(job["radius"] - radius) <= 1e-12
     )
+    qc_pending = bool(qc_row and qc_row["state"] in ("pending", "running"))
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -287,9 +340,15 @@ def dashboard(request: Request, notice: str | None = None, error: str | None = N
             "points_revisions": points_revisions,
             "stale_results": stale_results,
             "source_reason_text": SOURCE_REASON_TEXT,
+            "qc_row": qc_row,
+            "qc_findings": qc_findings,
+            "qc_history": qc_history,
+            "qc_state_text": QC_STATE_TEXT,
+            "qc_finding_text": QC_FINDING_TEXT,
+            "qc_pending": qc_pending,
             "notice": notice,
             "error": error,
-            "pending": pending,
+            "pending": pending or qc_pending,
             "worker_enabled": WORKER_ENABLED,
         },
     )
@@ -325,7 +384,8 @@ async def upload_network(
         "/",
         notice=(
             f"路网修订 {revision['revision_no']} 已受理，共 "
-            f"{len(parsed.segments)} 条路段；依赖旧路网的轨迹已失效并待重算"
+            f"{len(parsed.segments)} 条路段；旧质检与依赖旧路网的轨迹均已撤销/失效，"
+            "新版路网需重新发起质检，通过后才会重算轨迹"
         ),
     )
 
@@ -393,6 +453,25 @@ def recompute():
         return _redirect("/", error="请先上传路网和定位点各一个修订")
     notify_worker()
     return _redirect("/", notice="已安排重算")
+
+
+@app.post("/quality-check")
+def start_quality_check():
+    conn = _conn()
+    try:
+        if db.get_active_revision_id(conn, "network") is None:
+            return _redirect("/", error="请先上传路网修订")
+        check_id = service.open_quality_check(conn)
+        row = conn.execute(
+            "SELECT * FROM quality_checks WHERE id = ?", (check_id,)
+        ).fetchone()
+        already = row["state"] == "pending" and row["attempts"] == 0 and not row["error"]
+    finally:
+        conn.close()
+    notify_worker()
+    if already:
+        return _redirect("/", notice="已发起路网质检：该版轨迹立即停止供数，质检通过后才会安排重算")
+    return _redirect("/", notice="已安排路网质检重试，质检期间该版轨迹继续停止供数")
 
 
 @app.get("/results/{result_id}", response_class=HTMLResponse)

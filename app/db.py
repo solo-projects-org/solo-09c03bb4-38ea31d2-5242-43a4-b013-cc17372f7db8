@@ -55,6 +55,28 @@ CREATE TABLE IF NOT EXISTS active_sources (
     revision_id INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS quality_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    network_revision_id INTEGER NOT NULL REFERENCES network_revisions(id),
+    state TEXT NOT NULL CHECK (
+        state IN ('pending', 'running', 'passed', 'rejected',
+                  'failed', 'revoked')
+    ),
+    claim_token TEXT,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    finding_count INTEGER NOT NULL DEFAULT 0,
+    findings_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quality_checks_revision
+    ON quality_checks(network_revision_id, id);
+CREATE INDEX IF NOT EXISTS idx_quality_checks_state
+    ON quality_checks(state, id);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     network_revision_id INTEGER NOT NULL REFERENCES network_revisions(id),

@@ -19,6 +19,17 @@ def wait_for(predicate, timeout=10.0):
     raise AssertionError("condition not met in time")
 
 
+def pass_qc(path):
+    conn = db.connect(path)
+    try:
+        service.open_quality_check(conn)
+        check = service.claim_quality_check(conn)
+        assert check is not None
+        assert service.execute_quality_check(conn, check) == "passed"
+    finally:
+        conn.close()
+
+
 def upload(conn, kind, text):
     raw = text.encode()
     if kind == "network":
@@ -54,15 +65,91 @@ def test_worker_publishes_result(tmp_path):
     db.init_db(conn)
     upload(conn, "network", NET)
     upload(conn, "points", PTS)
+    conn.close()
+    pass_qc(path)
 
     worker = Worker(str(path))
     worker.start()
     try:
+        conn = db.connect(path)
         result = wait_for(lambda: service.current_result(conn))
     finally:
         worker.stop()
         conn.close()
     assert result["status"] == "valid"
+
+
+def test_worker_runs_quality_check_then_matching(tmp_path):
+    path = tmp_path / "w2.sqlite3"
+    conn = db.connect(path)
+    db.init_db(conn)
+    upload(conn, "network", NET)
+    upload(conn, "points", PTS)
+    service.open_quality_check(conn)
+    conn.close()
+
+    worker = Worker(str(path))
+    worker.start()
+    try:
+        conn = db.connect(path)
+
+        def qc_passed():
+            row = service.latest_quality_check(conn)
+            return row if row and row["state"] == "passed" else None
+
+        check = wait_for(qc_passed)
+        assert check["finding_count"] == 0
+        result = wait_for(lambda: service.current_result(conn))
+    finally:
+        worker.stop()
+        conn.close()
+    assert result["status"] == "valid"
+
+
+def test_worker_retries_quality_check_after_transient_failure(tmp_path, monkeypatch):
+    path = tmp_path / "w3.sqlite3"
+    conn = db.connect(path)
+    db.init_db(conn)
+    upload(conn, "network", NET)
+    service.open_quality_check(conn)
+    conn.close()
+
+    calls = {"n": 0}
+    real_run = service.run_quality_check
+
+    def flaky(segments):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient qc error")
+        return real_run(segments)
+
+    monkeypatch.setattr(service, "run_quality_check", flaky)
+    real_fail = service.fail_quality_check
+
+    def immediate_fail(conn_, check_id, token, message, attempts):
+        real_fail(conn_, check_id, token, message, 6)
+        conn_.execute(
+            "UPDATE quality_checks SET next_attempt_at = NULL WHERE id = ?",
+            (check_id,),
+        )
+
+    monkeypatch.setattr(service, "fail_quality_check", immediate_fail)
+
+    worker = Worker(str(path))
+    worker.start()
+    try:
+        conn = db.connect(path)
+
+        def qc_passed():
+            row = service.latest_quality_check(conn)
+            return row if row and row["state"] == "passed" else None
+
+        check = wait_for(qc_passed, timeout=15)
+    finally:
+        worker.stop()
+        conn.close()
+    assert calls["n"] >= 2
+    assert check["finding_count"] == 0
 
 
 def test_worker_retries_after_transient_failure(tmp_path, monkeypatch):
@@ -94,10 +181,13 @@ def test_worker_retries_after_transient_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "fail_job", immediate_fail)
 
     upload(conn, "points", PTS)
+    conn.close()
+    pass_qc(path)
 
     worker = Worker(str(path))
     worker.start()
     try:
+        conn = db.connect(path)
         result = wait_for(lambda: service.current_result(conn), timeout=15)
     finally:
         worker.stop()

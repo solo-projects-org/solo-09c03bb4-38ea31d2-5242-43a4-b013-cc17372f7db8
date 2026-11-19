@@ -36,8 +36,18 @@ def worker_client(tmp_path, monkeypatch):
         yield client, main_module
 
 
+def pass_quality_check(conn):
+    """Run the road-network QC to a passing state for the active revision."""
+    check_id = service.open_quality_check(conn)
+    check = service.claim_quality_check(conn)
+    assert check is not None and check["id"] == check_id
+    state = service.execute_quality_check(conn, check)
+    assert state == "passed"
+    return check_id
+
+
 def run_job(conn):
     job = service.claim_job(conn)
-    assert job is not None, "expected a pending job"
+    assert job is not None, "expected a claimable pending job (QC must pass first)"
     result_id = service.execute_job(conn, job)
     return job, result_id

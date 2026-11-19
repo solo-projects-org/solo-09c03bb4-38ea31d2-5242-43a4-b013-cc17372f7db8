@@ -46,15 +46,33 @@ def upload_points(client, rows, note=""):
     )
 
 
-def run_pending(main_module):
+def run_pending(main_module, pass_qc=True):
     from app import db
 
     conn = db.connect(main_module.DB_PATH)
     try:
+        if pass_qc:
+            from conftest import pass_quality_check
+
+            pass_quality_check(conn)
         job = service.claim_job(conn)
         assert job is not None
         result_id = service.execute_job(conn, job)
         return result_id
+    finally:
+        conn.close()
+
+
+def run_quality_check(main_module):
+    from app import db
+
+    conn = db.connect(main_module.DB_PATH)
+    try:
+        check_id = service.open_quality_check(conn)
+        check = service.claim_quality_check(conn)
+        assert check is not None and check["id"] == check_id
+        state = service.execute_quality_check(conn, check)
+        return check_id, state
     finally:
         conn.close()
 
@@ -245,3 +263,115 @@ def test_recompute_without_sources(worker_client):
 def test_health(worker_client):
     client, _ = worker_client
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_quality_check_panel_requires_network(worker_client):
+    client, _ = worker_client
+    resp = client.post("/quality-check", follow_redirects=True)
+    assert "请先上传路网修订" in resp.text
+    assert "路网质检" in resp.text
+
+
+def test_unchecked_network_shows_gate_badge(worker_client):
+    client, _ = worker_client
+    upload_network(client, [["A", 0, 0, 100, 0]])
+    upload_points(client, [["2026-11-18T00:00:00Z", 50, 0]])
+    dash = client.get("/")
+    assert "未质检" in dash.text
+    assert "尚未通过质检" in dash.text
+
+
+def test_quality_check_pass_then_publish_flow(worker_client):
+    client, main_module = worker_client
+    upload_network(
+        client, [["A", 0, 0, 100, 0], ["B", 100, 0, 200, 0]]
+    )
+    upload_points(
+        client,
+        [["2026-11-18T00:00:00Z", 50, 0], ["2026-11-18T00:00:05Z", 150, 0]],
+    )
+    # Before QC, the job cannot run and the dashboard explains the gate.
+    dash = client.get("/")
+    assert "尚未通过质检" in dash.text
+
+    resp = client.post("/quality-check", follow_redirects=True)
+    assert "已发起路网质检" in resp.text
+    check_id, state = run_quality_check(main_module)
+    assert state == "passed"
+
+    dash = client.get("/")
+    assert "质检通过" in dash.text
+    result_id = run_pending(main_module, pass_qc=False)
+    page = client.get(f"/results/{result_id}")
+    assert "A → B" in page.text
+    # QC history is visible.
+    assert f"#{check_id}" in client.get("/").text
+
+
+def test_quality_check_rejection_lists_defects(worker_client):
+    client, main_module = worker_client
+    upload_network(
+        client, [["A", 0, 0, 100, 0], ["B", 50, -50, 50, 50]]
+    )
+    upload_points(client, [["2026-11-18T00:00:00Z", 50, 0]])
+    client.post("/quality-check")
+    check_id, state = run_quality_check(main_module)
+    assert state == "rejected"
+
+    dash = client.get("/")
+    assert "质检不通过" in dash.text
+    assert "内点相交" in dash.text
+    assert "A、B" in dash.text
+    assert "50.000, 0.000" in dash.text
+    # No trajectory is published while the revision is rejected.
+    from app import db
+
+    conn = db.connect(main_module.DB_PATH)
+    try:
+        assert service.claim_job(conn) is None
+        assert service.current_result(conn) is None
+    finally:
+        conn.close()
+
+
+def test_quality_check_retry_after_error(worker_client):
+    client, main_module = worker_client
+    upload_network(client, [["A", 0, 0, 100, 0]])
+    client.post("/quality-check")
+
+    from app import db
+
+    conn = db.connect(main_module.DB_PATH)
+    try:
+        check = service.claim_quality_check(conn)
+        service.fail_quality_check(
+            conn, check["id"], check["claim_token"], "boom", 0
+        )
+    finally:
+        conn.close()
+    page = client.get("/")
+    assert "质检计算出错，维持待核，可重试" in page.text
+    # Retry endpoint reuses the pending check and clears the back-off.
+    resp = client.post("/quality-check", follow_redirects=True)
+    assert "已安排路网质检重试" in resp.text
+    conn = db.connect(main_module.DB_PATH)
+    try:
+        check = service.claim_quality_check(conn)
+        assert check is not None
+        state = service.execute_quality_check(conn, check)
+    finally:
+        conn.close()
+    assert state == "passed"
+
+
+def test_new_network_revokes_old_quality_check_in_ui(worker_client):
+    client, main_module = worker_client
+    upload_network(client, [["A", 0, 0, 100, 0]])
+    client.post("/quality-check")
+    run_quality_check(main_module)
+    upload_network(client, [["A", 0, 0, 100, 0], ["B", 100, 0, 200, 0]])
+    upload_points(client, [["2026-11-18T00:00:00Z", 50, 0]])
+    dash = client.get("/")
+    assert "已撤销（路网已换版）" in dash.text
+    assert "未质检" in dash.text
+    assert "尚未通过质检" in dash.text

@@ -13,6 +13,11 @@
         r{{ network_revision['revision_no'] }} ·
         {{ network_revision['segment_count'] }} 段 ·
         {{ network_revision['filename'] }}
+        {% if qc_row %}
+          <span class="badge {{ qc_row['state'] }}">{{ qc_state_text.get(qc_row['state'], qc_row['state']) }}</span>
+        {% else %}
+          <span class="badge stale">未质检</span>
+        {% endif %}
       {% else %}<span class="empty">未上传</span>{% endif %}
     </div>
     <div class="item"><strong>定位点修订</strong>
@@ -32,6 +37,107 @@
     <button type="submit">保存并重算</button>
   </form>
   <p class="hint">保存半径会立即作废已发布结果并安排重算，避免用旧参数的结果继续分析。</p>
+</div>
+
+<div class="panel">
+  <h2>路网质检（未拆分交点 / 重叠路段）</h2>
+  <p class="hint">
+    对同一平面层的当前路网修订逐对检查：两路段至少一方的内点相交，或共线部分有正长度，即判缺陷；
+    仅双方端点相接且无重叠视为正常。质检发起后该版轨迹立即停止供数；只有质检通过的路网修订才能发布轨迹。
+  </p>
+  {% if not network_revision %}
+    <p class="empty">请先上传路网修订。</p>
+  {% else %}
+    <form method="post" action="/quality-check">
+      <button type="submit">
+        {% if qc_row and qc_row['state'] in ('pending', 'running') %}
+          重新发起质检
+        {% elif qc_row and qc_row['state'] == 'failed' %}
+          重试质检（上次计算出错）
+        {% else %}
+          对当前路网修订发起质检
+        {% endif %}
+      </button>
+    </form>
+    {% if qc_row %}
+      <div class="meta" style="margin-top:14px">
+        <div class="item"><strong>质检编号</strong>#{{ qc_row['id'] }}</div>
+        <div class="item"><strong>路网修订</strong>r{{ network_revision['revision_no'] }}</div>
+        <div class="item"><strong>状态</strong>
+          <span class="badge {{ qc_row['state'] }}">{{ qc_state_text.get(qc_row['state'], qc_row['state']) }}</span>
+        </div>
+        <div class="item"><strong>发起时间（UTC）</strong>{{ qc_row['created_at'] }}</div>
+        {% if qc_row['finished_at'] %}
+        <div class="item"><strong>完成时间（UTC）</strong>{{ qc_row['finished_at'] }}</div>
+        {% endif %}
+        {% if qc_row['attempts'] %}
+        <div class="item"><strong>已尝试次数</strong>{{ qc_row['attempts'] }}</div>
+        {% endif %}
+      </div>
+      {% if qc_row['error'] %}
+        <div class="reason" style="margin-top:12px">
+          <strong>质检计算出错，维持待核，可重试。</strong>{{ qc_row['error'] }}
+        </div>
+      {% endif %}
+      {% if qc_row['state'] == 'rejected' %}
+        <div class="reason bad" style="margin-top:12px">
+          <strong>质检不通过：检出 {{ qc_row['finding_count'] }} 处缺陷，该版路网不得用于公交轨迹分析。</strong>
+        </div>
+        <div class="scroll" style="margin-top:10px;max-height:360px">
+        <table>
+          <thead><tr><th>#</th><th>缺陷类型</th><th>路段号</th><th>交点 / 重叠区间</th><th>重叠长度（m）</th></tr></thead>
+          <tbody>
+          {% for f in qc_findings %}
+            <tr>
+              <td class="num">{{ loop.index }}</td>
+              <td>{{ qc_finding_text.get(f['kind'], f['kind']) }}</td>
+              <td class="mono">{{ f['segment_ids']|join('、') }}</td>
+              <td class="mono">
+                {% if f['kind'] == 'intersection' %}
+                  交点 ({{ "%.3f"|format(f['point'][0]) }}, {{ "%.3f"|format(f['point'][1]) }})
+                  <span class="hint">（{{ f['interior_of']|join('、') }} 的内点）</span>
+                {% else %}
+                  {{ "%.3f"|format(f['from'][0]) }},{{ "%.3f"|format(f['from'][1]) }} →
+                  {{ "%.3f"|format(f['to'][0]) }},{{ "%.3f"|format(f['to'][1]) }}
+                {% endif %}
+              </td>
+              <td class="num">{{ "%.3f"|format(f['length']) if f['kind'] == 'overlap' else '—' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      {% elif qc_row['state'] == 'passed' %}
+        <p style="margin-top:12px">未检出内点相交或正长度共线重叠；已安排该版轨迹重算。</p>
+      {% elif qc_row['state'] in ('pending', 'running') %}
+        <p style="margin-top:12px">质检{% if qc_row['state'] == 'running' %}进行中{% else %}等待执行{% endif %}，该版轨迹已停止供数。</p>
+      {% elif qc_row['state'] == 'revoked' %}
+        <p style="margin-top:12px">该质检结论已随路网换版撤销，不得据此放行轨迹。</p>
+      {% endif %}
+    {% else %}
+      <p class="hint" style="margin-top:10px">当前路网修订尚未质检；未通过质检前不会发布任何轨迹。</p>
+    {% endif %}
+    {% if qc_history %}
+      <h3 style="font-size:15px;margin-top:18px">质检记录（新→旧）</h3>
+      <div class="scroll" style="max-height:220px">
+      <table>
+        <thead><tr><th>质检</th><th>路网</th><th>状态</th><th>缺陷数</th><th>说明</th><th>发起时间</th></tr></thead>
+        <tbody>
+        {% for q in qc_history %}
+          <tr>
+            <td>#{{ q['id'] }}</td>
+            <td>r{{ q['network_rev_no'] }}</td>
+            <td><span class="badge {{ q['state'] }}">{{ qc_state_text.get(q['state'], q['state']) }}</span></td>
+            <td class="num">{{ q['finding_count'] }}</td>
+            <td>{{ q['error'] or '' }}</td>
+            <td class="mono">{{ q['created_at'] }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% endif %}
+  {% endif %}
 </div>
 
 <div class="panel">
@@ -92,6 +198,8 @@
     <p class="empty">
       {% if not network_revision or not points_revision %}
         上传路网和定位点各一个修订后，系统会自动计算。
+      {% elif not qc_row or qc_row['state'] != 'passed' %}
+        当前路网修订尚未通过质检，轨迹不予发布；请先在上方发起并通过路网质检。
       {% elif pending %}
         当前来源{% if job and job['state'] == 'running' %}正在计算{% else %}等待重算{% endif %}，完成后在此显示结果。
       {% else %}
